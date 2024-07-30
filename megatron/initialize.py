@@ -7,6 +7,7 @@ import random
 import os
 import time
 
+import idr_torch
 import numpy as np
 import torch
 from datetime import timedelta
@@ -229,7 +230,11 @@ def _initialize_distributed():
         )
     # Call the init process
     if args.deepspeed or args.ds_inference:
-        deepspeed.init_distributed()
+        deepspeed.init_distributed(
+            dist_backend="nccl",
+            init_method="env://",
+            distributed_port=idr_torch.master_port
+        )
     else:
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(

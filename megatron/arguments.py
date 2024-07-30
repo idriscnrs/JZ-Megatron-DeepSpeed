@@ -12,6 +12,7 @@ import deepspeed
 import types
 from packaging import version
 
+import idr_torch
 import torch.nn.functional as F
 from megatron.global_vars import set_retro_args, get_retro_args
 from tools.retro.utils import get_args_path as get_retro_args_path
@@ -63,8 +64,8 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     args.ds_pipeline_enabled = not args.no_pipeline_parallel
 
     # Args from environment
-    args.rank = int(os.getenv('RANK', '0'))
-    args.world_size = int(os.getenv("WORLD_SIZE", '1'))
+    args.rank = idr_torch.rank
+    args.world_size = idr_torch.world_size
 
     return args
 
@@ -757,6 +758,8 @@ def _add_logging_args(parser):
                        help='The wandb experiment name.')
     group.add_argument('--wandb-save-dir', type=str, default='',
                        help='Path to save the wandb results locally.')
+    group.add_argument('--wandb-mode', type=str, default='offline',
+                       help='The wandb mode. Default is offline.')
 
     return parser
 
