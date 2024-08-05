@@ -233,7 +233,8 @@ def _initialize_distributed():
         deepspeed.init_distributed(
             dist_backend="nccl",
             init_method="env://",
-            distributed_port=idr_torch.master_port
+            distributed_port=idr_torch.master_port,
+            timeout=timedelta(seconds=2000)
         )
     else:
         if not torch.distributed.is_initialized():

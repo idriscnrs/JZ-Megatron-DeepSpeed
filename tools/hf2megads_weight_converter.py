@@ -17,6 +17,8 @@ from megatron.checkpointing import save_checkpoint
 from megatron.training import get_optimizer_param_scheduler
 from deepspeed.runtime.utils import see_memory_usage
 import deepspeed
+import safetensors
+import idr_torch
 
 
 def add_extra_args(parser):
@@ -27,6 +29,7 @@ def add_extra_args(parser):
                        type=str,
                        default="",
                        help="the original path of the llama-hf ckpt")
+    group.add_argument("--load-safetensors", action='store_true')
     return parser
 
 
@@ -37,20 +40,29 @@ def compute_partition_range(hidden_size, local_rank, tp_size):
     return partition_size, start_index, end_index
 
 
-def load_and_print_hf_weight(hf_ckpt_dir, hf_ckpt_num_of_shards):
+def load_and_print_hf_weight(
+    hf_ckpt_dir, hf_ckpt_num_of_shards, necessary_hf_layers, load_safetensors=False
+):
     # Optimization point: We can selectively load specific 'shared' data to reduce CPU memory usage.
     loaded = {}
     print_rank_0(
         f"----------------------------hf weight list----------------------------")
 
     for wid in range(1, hf_ckpt_num_of_shards + 1):
-        d = torch.load(
-            f"{hf_ckpt_dir}/pytorch_model-{wid:05d}-of-{hf_ckpt_num_of_shards:05d}.bin",
-            map_location=torch.device('cpu'))
+        if load_safetensors:
+            d = safetensors.torch.load_file(
+                f"{hf_ckpt_dir}/model-{wid:05d}-of-{hf_ckpt_num_of_shards:05d}.safetensors",
+                device='cpu'
+            )
+        else:
+            d = torch.load(
+                f"{hf_ckpt_dir}/pytorch_model-{wid:05d}-of-{hf_ckpt_num_of_shards:05d}.bin",
+                map_location=torch.device('cpu'))
         for k in d:
             print_rank_0(k)
             assert k not in loaded
-            loaded[k] = d[k].clone()
+            if k in necessary_hf_layers:
+                loaded[k] = d[k].clone()
     del d
     return loaded
 
@@ -131,28 +143,82 @@ class refactor:
         wk = self.loaded[hf_wk_name]
         wv = self.loaded[hf_wv_name]
 
-        hidden_size = wq.shape[0]
-        per_partition_size, start_index, end_index = compute_partition_range(
-            hidden_size, self.tp_rank, self.tp_size)
-        hidden_size_per_attention_head = divide(hidden_size,
-                                                self.config.num_attention_heads)
+        hidden_size_q = wq.shape[0]
+        hidden_size_k = wk.shape[0]
+        hidden_size_v = wv.shape[0]
+
+        per_partition_size_q, start_index_q, _ = compute_partition_range(
+            hidden_size_q, self.tp_rank, self.tp_size)
+        per_partition_size_k, start_index_k, _ = compute_partition_range(
+            hidden_size_k, self.tp_rank, self.tp_size)
+        per_partition_size_v, start_index_v, _ = compute_partition_range(
+            hidden_size_v, self.tp_rank, self.tp_size)
+
+        hidden_size_per_attention_head_q = divide(hidden_size_q,
+                                                  self.config.num_attention_heads)
+        hidden_size_per_attention_head_k = divide(hidden_size_k,
+                                                  self.config.num_attention_heads)
+        hidden_size_per_attention_head_v = divide(hidden_size_v,
+                                                  self.config.num_attention_heads)
+
         num_attention_heads_per_partition = divide(self.config.num_attention_heads,
                                                    self.tp_size)
 
-        new_w = torch.zeros((per_partition_size * 3, wq.shape[1]), dtype=wq.dtype)
+        new_w = torch.zeros((
+            per_partition_size_q + per_partition_size_k + per_partition_size_v,
+            wq.shape[1]
+        ), dtype=wq.dtype)
+        print(
+            f"################## rank{idr_torch.rank} ##################",
+            f"wq_shape: {wq.shape}",
+            f"hidden_size {hidden_size_q}, {hidden_size_k}, {hidden_size_v}",
+            f"per_partition_size {per_partition_size_q}, {per_partition_size_k}, {per_partition_size_v}",
+            f"start_index {start_index_q}, {start_index_k}, {start_index_v}",
+            f"tp_size {self.tp_size}",
+            f"hidden_size_per_attention_head {hidden_size_per_attention_head_q}, {hidden_size_per_attention_head_k}, {hidden_size_per_attention_head_v}",
+            f"num_attention_heads_per_partition {num_attention_heads_per_partition}",
+            sep="\n"
+        )
 
         for i in range(num_attention_heads_per_partition):
-            current_index = start_index + i * hidden_size_per_attention_head
-            next_index = current_index + hidden_size_per_attention_head
-            new_w_index = i * (3 * hidden_size_per_attention_head)
-            new_w[new_w_index: new_w_index + (3 * hidden_size_per_attention_head), :] = \
+            current_index_q = start_index_q + i * hidden_size_per_attention_head_q
+            current_index_k = start_index_k + i * hidden_size_per_attention_head_k
+            current_index_v = start_index_v + i * hidden_size_per_attention_head_v
+
+            next_index_q = current_index_q + hidden_size_per_attention_head_q
+            next_index_k = current_index_k + hidden_size_per_attention_head_k
+            next_index_v = current_index_v + hidden_size_per_attention_head_v
+
+            total_hidden_size_per_attention_head = (
+                hidden_size_per_attention_head_q
+                + hidden_size_per_attention_head_k
+                + hidden_size_per_attention_head_v
+            )
+            new_w_index = i * total_hidden_size_per_attention_head
+            print(
+                "##"
+                "current_index", current_index_q, current_index_k, current_index_v,
+                "next_index", next_index_q, next_index_k, next_index_v,
+                "new_w_index", new_w_index,
+                "shape_input", torch.cat([
+                    wq[current_index_q: next_index_q, :],
+                    wk[current_index_k: next_index_k, :],
+                    wv[current_index_v: next_index_v, :]
+                ], dim=0).shape,
+                "##"
+            )
+            new_w[new_w_index: new_w_index + total_hidden_size_per_attention_head, :] = \
                 torch.cat([
-                    wq[current_index: next_index, :],
-                    wk[current_index: next_index, :],
-                    wv[current_index: next_index, :]
+                    wq[current_index_q: next_index_q, :],
+                    wk[current_index_k: next_index_k, :],
+                    wv[current_index_v: next_index_v, :]
                 ], dim=0)
         self.record_mapping_info(
-            f"mega-ds:{pname,p.data.shape}<--hf{hf_wq_name,hf_wk_name,hf_wv_name,}  cat q,k,v [{current_index}:{next_index},:]  of q,k,v{wq.shape}"
+            f"mega-ds:{pname,p.data.shape}<--hf{hf_wq_name,hf_wk_name,hf_wv_name,}"
+            + f" cat q[{current_index_q}:{next_index_q},:],"
+            + f"k[{current_index_k}:{next_index_k},:],"
+            + f"v[{current_index_v}:{next_index_v},:]"
+            + f"of q,k,v{wq.shape}"
         )
         return new_w
 
@@ -272,6 +338,62 @@ class refactor:
                 torch.distributed.barrier()
 
 
+def select_necessary_hf_layers(model, args):
+    list_of_layers_name = []
+    mega_emb_wnum = 1
+    mega_norm_wnum = args.num_layers + 2
+    mega_lm_head_wnum = mega_norm_wnum + 1
+    decoder_pat = re.compile("(\d+)\.(.+)")
+    offset_num = 2
+    for pname, p in model.named_parameters():
+        if pname == f"{mega_lm_head_wnum}.lm_head.weight":
+            list_of_layers_name.append("lm_head.weight")
+        elif pname == f"{mega_emb_wnum}.word_embeddings.weight":
+            list_of_layers_name.append("model.embed_tokens.weight")
+        elif pname == f"{mega_norm_wnum}.weight":
+            list_of_layers_name.append("model.norm.weight")
+        else:
+            mobj = decoder_pat.match(pname)
+            layer_num = int(mobj.group(1))
+            subname = mobj.group(2)
+            hf_layer = layer_num - offset_num
+            if subname in ["self_attention.query_key_value.weight"]:
+                list_of_layers_name.append(f"model.layers.{hf_layer}.self_attn.q_proj.weight")
+                list_of_layers_name.append(f"model.layers.{hf_layer}.self_attn.k_proj.weight")
+                list_of_layers_name.append(f"model.layers.{hf_layer}.self_attn.v_proj.weight")
+            elif subname in ["mlp.dense_h_to_4h.weight"]:
+                list_of_layers_name.append(f"model.layers.{hf_layer}.mlp.gate_proj.weight")
+                list_of_layers_name.append(f"model.layers.{hf_layer}.mlp.up_proj.weight")
+            elif subname in [
+                    "self_attention.dense.weight",
+                    "mlp.dense_4h_to_h.weight"
+            ]:
+                if subname == "self_attention.dense.weight":
+                    list_of_layers_name.append(f"model.layers.{hf_layer}.self_attn.o_proj.weight")
+                else:
+                    list_of_layers_name.append(f"model.layers.{hf_layer}.mlp.down_proj.weight")
+            elif subname in [
+                    "mlp.dense_h_to_4h1.weight",
+                    "mlp.dense_h_to_4h2.weight"
+            ]:
+                if subname == "mlp.dense_h_to_4h1.weight":
+                    list_of_layers_name.append(f"model.layers.{hf_layer}.mlp.gate_proj.weight")
+                else:
+                    list_of_layers_name.append(f"model.layers.{hf_layer}.mlp.up_proj.weight")
+            elif subname in [
+                    "input_layernorm.weight",
+                    "post_attention_layernorm.weight"
+            ]:
+                if pname == f"{mega_norm_wnum}.weight":
+                    list_of_layers_name.append("model.norm.weight")
+                elif subname in ["input_layernorm.weight", "post_attention_layernorm.weight"]:
+                    list_of_layers_name.append(f"model.layers.{hf_layer}.{subname}")
+            else:
+                raise ValueError("Unrecognized weight type")
+
+    return list_of_layers_name
+
+
 def convert_hf_to_mega_ds():
     """Build the model."""
     args = get_args()
@@ -298,7 +420,10 @@ def convert_hf_to_mega_ds():
     # print hf weights list & mega-ds weights list
     hf_ckpt_dir = args.origin_hf_ckpt_dir
     hf_ckpt_num_of_shards = args.hf_ckpt_num_shards
-    loaded = load_and_print_hf_weight(hf_ckpt_dir, hf_ckpt_num_of_shards)
+    necessary_hf_layers = select_necessary_hf_layers(model, args)
+    loaded = load_and_print_hf_weight(
+        hf_ckpt_dir, hf_ckpt_num_of_shards, necessary_hf_layers, args.load_safetensors,
+    )
     print_distinct_weights(model)
 
     # refactor weight from hf to mega-ds
@@ -325,7 +450,7 @@ def convert_hf_to_mega_ds():
 
     print_rank_0(f"mega-ds checkpoint will be saved in {args.save}")
     save_checkpoint(0, [ds_engine], optimizer, opt_param_scheduler)
-    print_rank_0(f"save checkpoint completed")
+    print(f"save checkpoint completed at rank {idr_torch.rank}")
 
 
 if __name__ == "__main__":
